@@ -19,7 +19,9 @@
 //      falling knife: +$1.72 new window, -$13.19 old window), so it only runs as a
 //      backup for a falling race day after a guard exit.
 //   4. At most 4 round trips total, no entries after seq 1380, 20-bar cooldown
-//      after every exit, no re-entry into a trend position after a guard exit.
+//      after every exit (60 bars after a guard exit), no re-entry into a trend
+//      position after a guard exit; after a guard exit the sniper needs a
+//      deeper washout (RSI <= 15, 60-bar return <= -1.5%) before it may fire.
 //
 // Backtested (Python model of the kit's fill rules: fill at next open + 2 bps
 // slippage + constant-product impact + 4 bps fee) on the kit's frozen dev window
@@ -53,6 +55,9 @@ const WASH_TRAIL = 0.01;
 const WASH_RSI_EXIT = 60;
 const WASH_MAX_HOLD = 240;
 const COOLDOWN_BARS = 20;
+const POST_GUARD_WASH_RSI = 15;
+const POST_GUARD_WASH_DROP = -0.015;
+const POST_GUARD_COOLDOWN_BARS = 60;
 const RSI_PERIOD = 14;
 const TREND_RSI_MAX = 75;
 
@@ -140,7 +145,9 @@ runBars({
         if (pendingSell.reason === 'GUARD') crashed = true;
         if (pos !== null && pos.kind === 'wash') washRoundtrips += 1;
         pos = null;
-        coolUntil = pendingSell.bar + COOLDOWN_BARS;
+        coolUntil =
+          pendingSell.bar +
+          (pendingSell.reason === 'GUARD' ? POST_GUARD_COOLDOWN_BARS : COOLDOWN_BARS);
         pendingSell = null;
       } else if (fill.side === 'sell' && fill.status === 'rejected') {
         pendingSell = null;
@@ -203,11 +210,17 @@ runBars({
     const rsi5 = idx >= 5 ? rsiAt(idx - 5) : null;
     const bounce =
       close > opens[idx] * 1.002 || (rsi !== null && rsi5 !== null && rsi > rsi5 + 2);
+    // After a guard exit the market has just confirmed a >=1% fall from
+    // entry, so a sniper re-entry must demand a genuinely exhausted selloff
+    // (deeper RSI, bigger 60-bar drop) instead of the first bounce in a
+    // downtrend — re-entering after a guard exit churned in backtests.
+    const washRsi = crashed ? POST_GUARD_WASH_RSI : WASH_RSI;
+    const washDrop = crashed ? POST_GUARD_WASH_DROP : WASH_DROP;
     const wash =
       washRoundtrips < MAX_WASHOUT_RTS &&
       rsi !== null &&
-      rsi <= WASH_RSI &&
-      r60 <= WASH_DROP &&
+      rsi <= washRsi &&
+      r60 <= washDrop &&
       bounce;
     const trend =
       !crashed &&
