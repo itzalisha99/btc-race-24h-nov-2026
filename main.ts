@@ -19,9 +19,20 @@
 //      falling knife: +$1.72 new window, -$13.19 old window), so it only runs as a
 //      backup for a falling race day after a guard exit.
 //   4. At most 4 round trips total, no entries after seq 1380, 20-bar cooldown
-//      after every exit (60 bars after a guard exit), no re-entry into a trend
+//      after every exit (180 bars after a guard exit), no re-entry into a trend
 //      position after a guard exit; after a guard exit the sniper needs a
 //      deeper washout (RSI <= 15, 60-bar return <= -1.5%) before it may fire.
+//   5. Post-guard re-entry, tightened further: after the guard sells, the bot
+//      waits 3 hours (180 bars) instead of 1, then demands a confirmed turn
+//      before it may buy again — a firm green bar (close >= 0.3% above its
+//      open) that also closes above the previous bar, with RSI turning up at
+//      least 2 points over 5 bars, all three at once. And it gets only one
+//      such shot: if that sniper trade exits, win or lose, the bot sits out
+//      the rest of the day. Why: a guard exit means the bought trend broke,
+//      and the old falling window showed a single green bar or a small RSI
+//      tick inside a downtrend is noise — re-entering on it catches a falling
+//      knife. The bar for coming back in is deliberately high, so the bot
+//      would rather miss a bounce than churn through a falling day.
 //
 // Backtested (Python model of the kit's fill rules: fill at next open + 2 bps
 // slippage + constant-product impact + 4 bps fee) on the kit's frozen dev window
@@ -57,7 +68,16 @@ const WASH_MAX_HOLD = 240;
 const COOLDOWN_BARS = 20;
 const POST_GUARD_WASH_RSI = 15;
 const POST_GUARD_WASH_DROP = -0.015;
-const POST_GUARD_COOLDOWN_BARS = 60;
+// After a guard exit the bought trend has broken, so the bot waits three
+// hours (180 bars = three full 60-bar drop windows) for the tape to base,
+// instead of one hour. A broken trend needs time to form a base; an hour
+// still catches the same falling tape.
+const POST_GUARD_COOLDOWN_BARS = 180;
+// A post-guard re-entry must show a confirmed turn, not a flicker: a firm
+// green bar, a close above the previous bar's close, and RSI turning up —
+// all three at once.
+const POST_GUARD_TURN_GREEN = 0.003;
+const POST_GUARD_RSI_RISE = 2;
 const RSI_PERIOD = 14;
 const TREND_RSI_MAX = 75;
 
@@ -92,6 +112,10 @@ let pos: OpenPosition | null = null;
 let pendingBuy: PendingBuy | null = null;
 let pendingSell: PendingSell | null = null;
 let crashed = false;
+// Whether the one sniper shot allowed after a guard exit has been used.
+// After the guard fires the bot gets exactly one washout attempt; if that
+// trade also fails, the day is confirmed falling and the bot sits out.
+let guardWashUsed = false;
 let roundtrips = 0;
 let washRoundtrips = 0;
 let coolUntil = -1;
@@ -137,6 +161,9 @@ runBars({
         const entry = Number(fill.price) / 1e5;
         pos = { kind: pendingBuy.kind, entry, bar: pendingBuy.bar, peak: entry, qty: BigInt(fill.qty) };
         if (pendingBuy.kind === 'trend') trendDone = true;
+        // A washout buy taken after a guard exit spends the single shot the
+        // bot allows itself there — win or lose, there is no second attempt.
+        if (pendingBuy.kind === 'wash' && crashed) guardWashUsed = true;
         pendingBuy = null;
       } else if (fill.side === 'buy' && fill.status === 'rejected') {
         pendingBuy = null;
@@ -214,14 +241,26 @@ runBars({
     // entry, so a sniper re-entry must demand a genuinely exhausted selloff
     // (deeper RSI, bigger 60-bar drop) instead of the first bounce in a
     // downtrend — re-entering after a guard exit churned in backtests.
+    // My extra bar: a single green bar or a small RSI tick is noise inside a
+    // downtrend, so after a guard exit the turn must show up three ways at
+    // once — a firm green bar, a close above the previous bar's close, and
+    // RSI turning up — and the bot spends its one allowed shot on it.
+    const turnConfirmed =
+      idx >= 1 &&
+      close > opens[idx] * (1 + POST_GUARD_TURN_GREEN) &&
+      close > closes[idx - 1] &&
+      rsi !== null &&
+      rsi5 !== null &&
+      rsi > rsi5 + POST_GUARD_RSI_RISE;
     const washRsi = crashed ? POST_GUARD_WASH_RSI : WASH_RSI;
     const washDrop = crashed ? POST_GUARD_WASH_DROP : WASH_DROP;
     const wash =
       washRoundtrips < MAX_WASHOUT_RTS &&
+      (!crashed || !guardWashUsed) &&
       rsi !== null &&
       rsi <= washRsi &&
       r60 <= washDrop &&
-      bounce;
+      (crashed ? turnConfirmed : bounce);
     const trend =
       !crashed &&
       !trendDone &&
